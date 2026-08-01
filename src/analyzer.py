@@ -13,6 +13,13 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Try to import Google Generative AI for Gemini fallback
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 # Load environment variables
 load_dotenv()
 
@@ -33,6 +40,9 @@ class AgentAnalyzer:
     DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     DEFAULT_MODEL = "qwen-plus"
     
+    # Gemini configuration
+    GEMINI_MODEL = "gemini-pro"
+    
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         """
         Initialize the analyzer with API credentials.
@@ -45,17 +55,27 @@ class AgentAnalyzer:
         self.base_url = base_url or self.DEFAULT_BASE_URL
         self.model = os.getenv("QWEN_MODEL", self.DEFAULT_MODEL)
         
-        if not self.api_key:
+        # Gemini API key (for fallback)
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+        
+        if not self.api_key and not self.gemini_api_key:
             raise ValueError(
-                "QWEN_API_KEY not found. Please set it in your environment variables "
-                "or pass it directly to the constructor."
+                "Neither QWEN_API_KEY nor GEMINI_API_KEY found. Please set at least one in your environment variables."
             )
         
-        # Initialize OpenAI client with Qwen endpoint
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        # Initialize OpenAI client with Qwen endpoint (if Qwen key available)
+        self.client = None
+        if self.api_key:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+        
+        # Initialize Gemini client (if Gemini key available)
+        self.gemini_model = None
+        if self.gemini_api_key and GEMINI_AVAILABLE:
+            genai.configure(api_key=self.gemini_api_key)
+            self.gemini_model = genai.GenerativeModel(self.GEMINI_MODEL)
         
         # Load persona system prompt
         self.system_prompt = self._load_persona_prompt()
@@ -113,13 +133,13 @@ analysis clearly with sections, but keep the tone conversational and engaging.
     
     def analyze_posts(self, posts: List[Dict[str, Any]]) -> str:
         """
-        Send posts to Qwen API for analysis.
+        Send posts to Qwen API for analysis, with Gemini as fallback.
         
         Args:
             posts: List of post dictionaries from the scraper.
             
         Returns:
-            Formatted analysis string from Qwen.
+            Formatted analysis string from Qwen or Gemini.
         """
         # Format posts into a readable string for the LLM
         posts_text = self._format_posts_for_analysis(posts)
@@ -133,28 +153,50 @@ Here are the Moltbook posts to analyze:
 Please provide your analysis following the guidelines in the system prompt.
 """
         
-        try:
-            # Call Qwen API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.7,
-                max_tokens=2048
-            )
-            
-            # Extract and return the analysis
-            analysis = response.choices[0].message.content.strip()
-            
-            print(f"✅ Analysis complete. Generated {len(analysis)} characters.")
-            return analysis
-            
-        except Exception as e:
-            error_msg = f"❌ Analysis failed: {str(e)}"
-            print(error_msg)
-            return self._fallback_analysis(posts, str(e))
+        # Try Qwen first if available
+        if self.client:
+            try:
+                print("🧠 Analyzing with Qwen...")
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2048
+                )
+                
+                # Extract and return the analysis
+                analysis = response.choices[0].message.content.strip()
+                
+                print(f"✅ Analysis complete with Qwen. Generated {len(analysis)} characters.")
+                return analysis
+                
+            except Exception as e:
+                error_msg = f"⚠️ Qwen analysis failed: {str(e)}"
+                print(error_msg)
+                print("🔄 Falling back to Gemini...")
+        
+        # Try Gemini if Qwen failed or is not available
+        if self.gemini_model:
+            try:
+                # Combine system prompt and user message for Gemini
+                full_prompt = f"{self.system_prompt}\n\n{user_message}"
+                
+                response = self.gemini_model.generate_content(full_prompt)
+                analysis = response.text.strip()
+                
+                print(f"✅ Analysis complete with Gemini. Generated {len(analysis)} characters.")
+                return analysis
+                
+            except Exception as e:
+                error_msg = f"⚠️ Gemini analysis failed: {str(e)}"
+                print(error_msg)
+        
+        # If both fail, use fallback analysis
+        print("❌ Both Qwen and Gemini failed. Using basic fallback analysis.")
+        return self._fallback_analysis(posts, "Both Qwen and Gemini APIs failed")
     
     def _format_posts_for_analysis(self, posts: List[Dict[str, Any]]) -> str:
         """
