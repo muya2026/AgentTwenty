@@ -40,9 +40,10 @@ jobs:
         run: python main.py
 
       - name: Upload Generated Reports (Artifact)
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: daily-reports
-          path: data/*.md
+          path: ./data/
           retention-days: 5
+          if-no-files-found: ignore
