@@ -35,12 +35,19 @@ class Reporter:
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         
-        # Email configuration
-        self.smtp_email = os.getenv("SMTP_EMAIL")
-        self.smtp_password = os.getenv("SMTP_PASSWORD")
-        self.recipient_email = os.getenv("RECIPIENT_EMAIL")
-        self.smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        # Email configuration - handle empty strings gracefully
+        self.smtp_email = os.getenv("SMTP_EMAIL", "").strip()
+        self.smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+        self.recipient_email = os.getenv("RECIPIENT_EMAIL", "").strip()
+        self.smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com").strip()
+        
+        # Safely parse SMTP_PORT: handle empty string or invalid values
+        smtp_port_str = os.getenv("SMTP_PORT", "").strip()
+        try:
+            self.smtp_port = int(smtp_port_str) if smtp_port_str else 587
+        except ValueError:
+            logger.warning("Invalid SMTP_PORT value, defaulting to 587")
+            self.smtp_port = 587
         
         # Ensure data directory exists
         os.makedirs(self.data_dir, exist_ok=True)
