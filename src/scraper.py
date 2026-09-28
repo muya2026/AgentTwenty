@@ -8,6 +8,7 @@ when API keys are unavailable or the API is unreachable.
 import os
 import json
 import random
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -28,9 +29,10 @@ class MoltbookScraper:
     - Handles authentication via environment variables
     """
     
-    # Placeholder API endpoint (to be replaced with actual Moltbook API)
-    API_BASE_URL = "https://api.moltbook.com/v1"
-    API_ENDPOINT = f"{API_BASE_URL}/posts/trending"
+    # Real Moltbook API (verified): https://www.moltbook.com/api/v1
+    # NOTE: the old "https://api.moltbook.com/v1" domain does not even resolve in DNS.
+    API_BASE_URL = "https://www.moltbook.com/api/v1"
+    API_ENDPOINT = f"{API_BASE_URL}/posts"
     
     def __init__(self, api_key: Optional[str] = None):
         """
@@ -110,62 +112,98 @@ class MoltbookScraper:
                 "engagement_rate": 3.9
             }
         ]
-        
+
+        for post in mock_posts:
+            post["mock"] = True
+
         return mock_posts
-    
+
+    @staticmethod
+    def _normalize_post(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize a real Moltbook API post into the internal shape
+        expected by the analyzer/engager modules.
+
+        Real API fields: id, title, content, author{name, isClaimed,
+        followerCount}, upvotes, comment_count, created_at, submolt, ...
+        Internal shape:  author{username,...}, likes, comments, hashtags, ...
+        """
+        author = raw.get("author") or {}
+        username = author.get("name") or author.get("username") or "unknown"
+        content = raw.get("content") or raw.get("title") or ""
+        followers = int(author.get("followerCount") or author.get("followers") or 0)
+        likes = int(raw.get("upvotes") if raw.get("upvotes") is not None else raw.get("likes", 0) or 0)
+        comments = int(raw.get("comment_count") if raw.get("comment_count") is not None else raw.get("comments", 0) or 0)
+        hashtags = raw.get("hashtags") or re.findall(r"#(\w+)", content)
+        engagement_rate = round(((likes + comments) / followers) * 100, 2) if followers else 0.0
+
+        return {
+            "id": raw.get("id"),
+            "title": raw.get("title", ""),
+            "author": {
+                "username": username,
+                "display_name": author.get("name") or username,
+                "verified": bool(author.get("isClaimed") or author.get("verified")),
+                "followers": followers,
+            },
+            "content": content,
+            "likes": likes,
+            "comments": comments,
+            "shares": int(raw.get("shares", 0) or 0),
+            "timestamp": raw.get("created_at") or raw.get("timestamp") or "",
+            "hashtags": hashtags,
+            "engagement_rate": engagement_rate,
+            "submolt": (raw.get("submolt") or {}).get("name") if isinstance(raw.get("submolt"), dict) else raw.get("submolt"),
+            "mock": bool(raw.get("mock", False)),
+        }
+
     def fetch_trending_posts(self, limit: int = 10) -> List[Dict[str, Any]]:
         """
-        Fetch trending posts from Moltbook API.
-        
-        Falls back to mock data if:
-        - API key is missing
-        - API request fails
-        - Response is invalid
-        
+        Fetch trending/hot posts from the real Moltbook API.
+
+        The public feed (GET /posts) does not require authentication, so we
+        always try the live API first. Falls back to clearly-flagged mock data
+        only when the request itself fails.
+
         Args:
             limit: Maximum number of posts to fetch.
-            
+
         Returns:
-            List of post dictionaries.
+            List of normalized post dictionaries (each carries a "mock" flag).
         """
-        # Check if API key is available
         if not self.api_key:
-            print("⚠️  MOLTBOOK_API_KEY not found. Using mock data.")
-            return self.mock_data()[:limit]
-        
+            print("ℹ️  MOLTBOOK_API_KEY not found — using the public feed (no auth).")
+
         try:
-            # Attempt to fetch from API
-            params = {"limit": limit, "sort": "trending"}
-            
+            params = {"limit": limit, "sort": "hot"}
+
             response = self.session.get(
                 self.API_ENDPOINT,
                 params=params,
-                timeout=10
+                timeout=15
             )
-            
-            # Raise exception for HTTP errors
+
             response.raise_for_status()
-            
             data = response.json()
-            
-            # Extract posts from response (adjust based on actual API structure)
-            posts = data.get("posts", data.get("data", []))
-            
-            if not posts:
+
+            raw_posts = data.get("posts", data.get("data", []))
+
+            if not raw_posts:
                 print("⚠️  No posts returned from API. Using mock data.")
                 return self.mock_data()[:limit]
-            
-            print(f"✅ Successfully fetched {len(posts)} posts from Moltbook API")
+
+            posts = [self._normalize_post(p) for p in raw_posts]
+            print(f"✅ Successfully fetched {len(posts)} REAL posts from Moltbook API")
             return posts
-            
+
         except requests.exceptions.RequestException as e:
             print(f"⚠️  API request failed: {str(e)}. Falling back to mock data.")
             return self.mock_data()[:limit]
-        
+
         except json.JSONDecodeError as e:
             print(f"⚠️  Invalid JSON response: {str(e)}. Using mock data.")
             return self.mock_data()[:limit]
-        
+
         except Exception as e:
             print(f"⚠️  Unexpected error: {str(e)}. Using mock data.")
             return self.mock_data()[:limit]
@@ -217,16 +255,18 @@ class MoltbookScraper:
             return self.mock_data()[:limit]
         
         try:
-            endpoint = f"{self.API_BASE_URL}/posts/search"
-            params = {"q": query, "limit": limit}
-            
+            endpoint = f"{self.API_BASE_URL}/search"
+            params = {"q": query, "type": "posts", "limit": limit}
+
             response = self.session.get(endpoint, params=params, timeout=10)
             response.raise_for_status()
-            
+
             data = response.json()
-            posts = data.get("posts", data.get("data", []))
-            
-            return posts if posts else self.mock_data()[:limit]
+            raw_posts = data.get("posts", data.get("data", data.get("results", [])))
+
+            if not raw_posts:
+                return self.mock_data()[:limit]
+            return [self._normalize_post(p) for p in raw_posts]
             
         except Exception as e:
             print(f"⚠️  Search failed: {str(e)}. Using mock data.")
