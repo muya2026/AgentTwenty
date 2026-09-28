@@ -10,6 +10,8 @@ venv/
 .env
 .env.local
 *.env.*
+# ...but never ignore the example template referenced by the README
+!*.env.example
 
 # Build artifacts
 dist/
@@ -38,3 +40,5 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 ```
+# Local run outputs (uploaded as CI artifacts instead)
+data/
