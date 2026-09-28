@@ -40,8 +40,9 @@ class AgentAnalyzer:
     DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     DEFAULT_MODEL = "qwen-plus"
     
-    # Gemini configuration
-    GEMINI_MODEL = "gemini-pro"
+    # Gemini configuration (env-overridable; "gemini-flash-latest" always
+    # points at the current Flash model — "gemini-pro" was retired)
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
     
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         """
@@ -61,8 +62,18 @@ class AgentAnalyzer:
         # NOTE: we deliberately do NOT raise when keys are missing — the README
         # promises graceful degradation, and analyze_posts() falls back to
         # basic stats-based analysis when no client is available.
-        if not self.api_key and not self.gemini_api_key:
-            print("⚠️  Neither QWEN_API_KEY nor GEMINI_API_KEY found. "
+        # Groq backup engine (free tier, OpenAI-compatible)
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        self.groq_client = None
+        if self.groq_api_key:
+            self.groq_client = OpenAI(
+                api_key=self.groq_api_key,
+                base_url="https://api.groq.com/openai/v1",
+                timeout=30.0,
+            )
+
+        if not self.api_key and not self.gemini_api_key and not self.groq_api_key:
+            print("⚠️  No AI keys found (QWEN_API_KEY / GEMINI_API_KEY / GROQ_API_KEY). "
                   "Analysis will use the basic fallback (no LLM call).")
         
         # Initialize OpenAI client with Qwen endpoint (if Qwen key available)
@@ -143,6 +154,9 @@ analysis clearly with sections, but keep the tone conversational and engaging.
         Returns:
             Formatted analysis string from Qwen or Gemini.
         """
+        # Track which backend produced the result (for strict-mode diagnostics)
+        self.last_backend = None
+
         # Format posts into a readable string for the LLM
         posts_text = self._format_posts_for_analysis(posts)
         
@@ -173,6 +187,7 @@ Please provide your analysis following the guidelines in the system prompt.
                 analysis = response.choices[0].message.content.strip()
                 
                 print(f"✅ Analysis complete with Qwen. Generated {len(analysis)} characters.")
+                self.last_backend = "qwen"
                 return analysis
                 
             except Exception as e:
@@ -190,15 +205,37 @@ Please provide your analysis following the guidelines in the system prompt.
                 analysis = response.text.strip()
                 
                 print(f"✅ Analysis complete with Gemini. Generated {len(analysis)} characters.")
+                self.last_backend = "gemini"
                 return analysis
                 
             except Exception as e:
                 error_msg = f"⚠️ Gemini analysis failed: {str(e)}"
                 print(error_msg)
+
+        # Try Groq (free-tier backup) if configured
+        if self.groq_client:
+            try:
+                print("🧠 Analyzing with Groq...")
+                response = self.groq_client.chat.completions.create(
+                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2048
+                )
+                analysis = response.choices[0].message.content.strip()
+                print(f"✅ Analysis complete with Groq. Generated {len(analysis)} characters.")
+                self.last_backend = "groq"
+                return analysis
+            except Exception as e:
+                print(f"⚠️ Groq analysis failed: {str(e)}")
         
-        # If both fail (or no keys are configured), use fallback analysis
-        print("❌ Qwen/Gemini unavailable or failed. Using basic fallback analysis.")
-        return self._fallback_analysis(posts, "Qwen/Gemini unavailable or failed")
+        # If every engine fails (or no keys are configured), use fallback analysis
+        print("❌ All AI engines unavailable or failed. Using basic fallback analysis.")
+        self.last_backend = "fallback"
+        return self._fallback_analysis(posts, "All AI engines unavailable or failed")
     
     def _format_posts_for_analysis(self, posts: List[Dict[str, Any]]) -> str:
         """
@@ -326,7 +363,7 @@ By @{top_post.get('author', {}).get('username', 'unknown')}
         Compare multiple posts and identify patterns.
         
         Args:
-            posts: List of posts to compare.
+            posts: List of post dictionaries.
             
         Returns:
             Comparative analysis highlighting patterns and differences.
