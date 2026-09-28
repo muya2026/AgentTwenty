@@ -13,12 +13,12 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -30,6 +30,7 @@ jobs:
           MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
           QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
@@ -43,7 +44,7 @@ jobs:
         run: python main.py
 
       - name: Upload Generated Reports (Artifact)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: daily-reports
