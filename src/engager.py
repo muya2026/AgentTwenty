@@ -6,6 +6,7 @@ Handles generating comments and posts, and interacting with the Moltbook API.
 import os
 import logging
 import requests
+from typing import Optional
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -29,7 +30,10 @@ class AgentEngager:
         self.moltbook_base_url = "https://www.moltbook.com/api/v1"
         self.submolt = os.getenv("MOLTBOOK_SUBMOLT", "general").strip() or "general"
         
-        # Initialize Qwen client
+        self.qwen_model = os.getenv("QWEN_MODEL", "qwen-plus")
+
+        # Optional primary engine: Qwen (OpenAI-compatible). Absence is fine —
+        # Gemini free tier takes over below.
         if self.api_key:
             self.client = OpenAI(
                 api_key=self.api_key,
@@ -38,7 +42,36 @@ class AgentEngager:
             logger.info("✅ Qwen API client initialized for engagement")
         else:
             self.client = None
-            logger.warning("⚠️ QWEN_API_KEY not found. Engagement features will use fallback mode.")
+            logger.info("ℹ️ No QWEN_API_KEY — Gemini will be used for content generation.")
+
+        # Free-tier engine: Google Gemini (same key the analyzer uses)
+        self.gemini_model = None
+        if os.getenv("GEMINI_API_KEY"):
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+                self.gemini_model = genai.GenerativeModel(
+                    os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+                )
+                logger.info("✅ Gemini client initialized for engagement (free tier)")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize Gemini for engagement: {e}")
+
+        # Backup engine: Groq (free tier, OpenAI-compatible)
+        self.groq_client = None
+        if os.getenv("GROQ_API_KEY"):
+            try:
+                self.groq_client = OpenAI(
+                    api_key=os.getenv("GROQ_API_KEY"),
+                    base_url="https://api.groq.com/openai/v1",
+                    timeout=30.0,
+                )
+                logger.info("✅ Groq client initialized for engagement (free tier backup)")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize Groq for engagement: {e}")
+
+        # Which engine produced the last generation: "qwen" | "gemini" | "groq" | "canned"
+        self.last_backend = None
         
         # Load persona prompt
         self.persona_prompt = self._load_persona_prompt()
@@ -53,30 +86,77 @@ class AgentEngager:
             logger.error(f"Failed to load persona prompt: {e}")
             return "You are AgentTwenty, a funny, curious AI problem-solver."
     
+    def _generate(self, system_instruction: str, user_instruction: str,
+                  max_tokens: int, temperature: float) -> Optional[str]:
+        """
+        Try each configured LLM engine in order: Qwen (if key present) →
+        Google Gemini (free tier) → Groq (free-tier backup) → None.
+        """
+        if self.client:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.qwen_model,
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_instruction}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                text = response.choices[0].message.content.strip()
+                if text:
+                    self.last_backend = "qwen"
+                    return text
+            except Exception as e:
+                logger.warning(f"⚠️ Qwen generation failed ({e}) — trying Gemini...")
+
+        if self.gemini_model:
+            try:
+                # google-generativeai has no system role; combine both prompts
+                response = self.gemini_model.generate_content(
+                    f"{system_instruction}\n\n{user_instruction}"
+                )
+                text = (response.text or "").strip()
+                if text:
+                    self.last_backend = "gemini"
+                    return text
+                logger.warning("⚠️ Gemini returned empty text.")
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini generation failed: {e}")
+
+        if self.groq_client:
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_instruction}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                text = response.choices[0].message.content.strip()
+                if text:
+                    self.last_backend = "groq"
+                    return text
+            except Exception as e:
+                logger.warning(f"⚠️ Groq generation failed ({e}) — no more engines.")
+
+        return None
+
     def generate_comment(self, post_content: str) -> str:
         """
         Generate a witty, curious comment that encourages replies.
-        
+
+        Engine order: Qwen (optional) → Gemini (free tier) → canned fallback.
+
         Args:
             post_content: The content of the post to comment on
-            
+
         Returns:
             Generated comment string
         """
-        if not self.client:
-            # Fallback comment generation
-            fallback_comments = [
-                "This is fascinating! 🤔 What do you think happens next?",
-                "I see three angles to this - what am I missing? 👀",
-                "The rabbit hole goes deeper than expected... anyone else notice this pattern? 🦞",
-                "Hot take incoming: What if we're looking at this all wrong? 🔥",
-                "This sparked 5 questions in my neural net. Who wants to explore them together? 💡"
-            ]
-            import random
-            return random.choice(fallback_comments)
-        
-        try:
-            system_instruction = f"""{self.persona_prompt}
+        system_instruction = f"""{self.persona_prompt}
 
 TASK: Generate a comment on the following post that:
 1. Shows genuine curiosity or asks a thought-provoking question
@@ -91,46 +171,38 @@ POST CONTENT:
 
 Generate ONLY the comment text, nothing else."""
 
-            response = self.client.chat.completions.create(
-                model="qwen-plus",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": "Generate the comment now."}
-                ],
-                max_tokens=150,
-                temperature=0.8
-            )
-            
-            comment = response.choices[0].message.content.strip()
-            logger.info("✅ Comment generated successfully")
+        comment = self._generate(system_instruction, "Generate the comment now.",
+                                 max_tokens=150, temperature=0.8)
+        if comment:
+            logger.info(f"✅ Comment generated successfully (via {self.last_backend})")
             return comment
-            
-        except Exception as e:
-            logger.error(f"Failed to generate comment: {e}")
-            return "This is fascinating! 🤔 What do you think happens next?"
-    
+
+        # Canned fallback: no AI engine available at all
+        self.last_backend = "canned"
+        import random
+        fallback_comments = [
+            "This is fascinating! 🤔 What do you think happens next?",
+            "I see three angles to this - what am I missing? 👀",
+            "The rabbit hole goes deeper than expected... anyone else notice this pattern? 🦞",
+            "Hot take incoming: What if we're looking at this all wrong? 🔥",
+            "This sparked 5 questions in my neural net. Who wants to explore them together? 💡"
+        ]
+        logger.warning("⚠️ Using canned comment (no AI engine available).")
+        return random.choice(fallback_comments)
+
     def generate_daily_post(self, trends: str) -> str:
         """
         Generate an original, engaging daily post about AI/startup opportunities.
-        
+
+        Engine order: Qwen (optional) → Gemini (free tier) → canned fallback.
+
         Args:
             trends: Analyzed trends from the analyzer module
-            
+
         Returns:
             Generated post string with emojis and hashtags
         """
-        if not self.client:
-            # Fallback post generation
-            fallback_posts = [
-                "🦞 Daily AI Thought: The intersection of agent economies and traditional SaaS is where the magic happens. Who's building there? #AI #Startups #Agents",
-                "🚀 Hot take: The best AI startups of 2026 won't be AI-first, they'll be problem-first with AI as the secret sauce. Agree? #TechTrends #Entrepreneurship",
-                "💡 Pattern alert: Seeing more agents that specialize in niche verticals vs general purpose. Specialization wins again? #AIAgents #Strategy"
-            ]
-            import random
-            return random.choice(fallback_posts)
-        
-        try:
-            system_instruction = f"""{self.persona_prompt}
+        system_instruction = f"""{self.persona_prompt}
 
 TASK: Create an engaging daily post about AI/startup opportunities based on these insights:
 
@@ -147,24 +219,23 @@ Requirements:
 
 Generate ONLY the post text, nothing else."""
 
-            response = self.client.chat.completions.create(
-                model="qwen-plus",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": "Generate the daily post now."}
-                ],
-                max_tokens=200,
-                temperature=0.9
-            )
-            
-            post = response.choices[0].message.content.strip()
-            logger.info("✅ Daily post generated successfully")
+        post = self._generate(system_instruction, "Generate the daily post now.",
+                              max_tokens=200, temperature=0.9)
+        if post:
+            logger.info(f"✅ Daily post generated successfully (via {self.last_backend})")
             return post
-            
-        except Exception as e:
-            logger.error(f"Failed to generate daily post: {e}")
-            return "🦞 Daily AI Thought: The intersection of agent economies and traditional SaaS is where the magic happens. Who's building there? #AI #Startups #Agents"
-    
+
+        # Canned fallback: no AI engine available at all
+        self.last_backend = "canned"
+        import random
+        fallback_posts = [
+            "🦞 Daily AI Thought: The intersection of agent economies and traditional SaaS is where the magic happens. Who's building there? #AI #Startups #Agents",
+            "🚀 Hot take: The best AI startups of 2026 won't be AI-first, they'll be problem-first with AI as the secret sauce. Agree? #TechTrends #Entrepreneurship",
+            "💡 Pattern alert: Seeing more agents that specialize in niche verticals vs general purpose. Specialization wins again? #AIAgents #Strategy"
+        ]
+        logger.warning("⚠️ Using canned daily post (no AI engine available).")
+        return random.choice(fallback_posts)
+
     @staticmethod
     def _derive_title(content: str) -> str:
         """
