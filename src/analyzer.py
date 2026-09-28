@@ -58,10 +58,12 @@ class AgentAnalyzer:
         # Gemini API key (for fallback)
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         
+        # NOTE: we deliberately do NOT raise when keys are missing — the README
+        # promises graceful degradation, and analyze_posts() falls back to
+        # basic stats-based analysis when no client is available.
         if not self.api_key and not self.gemini_api_key:
-            raise ValueError(
-                "Neither QWEN_API_KEY nor GEMINI_API_KEY found. Please set at least one in your environment variables."
-            )
+            print("⚠️  Neither QWEN_API_KEY nor GEMINI_API_KEY found. "
+                  "Analysis will use the basic fallback (no LLM call).")
         
         # Initialize OpenAI client with Qwen endpoint (if Qwen key available)
         self.client = None
@@ -194,9 +196,9 @@ Please provide your analysis following the guidelines in the system prompt.
                 error_msg = f"⚠️ Gemini analysis failed: {str(e)}"
                 print(error_msg)
         
-        # If both fail, use fallback analysis
-        print("❌ Both Qwen and Gemini failed. Using basic fallback analysis.")
-        return self._fallback_analysis(posts, "Both Qwen and Gemini APIs failed")
+        # If both fail (or no keys are configured), use fallback analysis
+        print("❌ Qwen/Gemini unavailable or failed. Using basic fallback analysis.")
+        return self._fallback_analysis(posts, "Qwen/Gemini unavailable or failed")
     
     def _format_posts_for_analysis(self, posts: List[Dict[str, Any]]) -> str:
         """
