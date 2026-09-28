@@ -37,6 +37,9 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          # Fail the run unless a REAL post + comment were published on Moltbook.
+          # This prevents the old "green checkmark, zero real actions" problem.
+          REQUIRE_REAL_ACTIONS: "true"
         run: python main.py
 
       - name: Upload Generated Reports (Artifact)
