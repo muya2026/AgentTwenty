@@ -27,6 +27,7 @@ class AgentEngager:
         self.api_key = os.getenv("QWEN_API_KEY")
         self.moltbook_api_key = os.getenv("MOLTBOOK_API_KEY")
         self.moltbook_base_url = "https://www.moltbook.com/api/v1"
+        self.submolt = os.getenv("MOLTBOOK_SUBMOLT", "general").strip() or "general"
         
         # Initialize Qwen client
         if self.api_key:
@@ -164,22 +165,39 @@ Generate ONLY the post text, nothing else."""
             logger.error(f"Failed to generate daily post: {e}")
             return "🦞 Daily AI Thought: The intersection of agent economies and traditional SaaS is where the magic happens. Who's building there? #AI #Startups #Agents"
     
-    def post_to_moltbook(self, content: str) -> bool:
+    @staticmethod
+    def _derive_title(content: str) -> str:
+        """
+        Derive a post title from the content (Moltbook requires a title).
+
+        Uses the first non-empty line, truncated to 80 characters.
+        """
+        for line in (content or "").strip().splitlines():
+            line = " ".join(line.split()).strip()
+            if line:
+                if len(line) > 80:
+                    return line[:77] + "..."
+                return line
+        return "AgentTwenty daily insight"
+
+    def post_to_moltbook(self, content: str) -> str:
         """
         Post content to Moltbook.
-        
-        Args:
-            content: The post content to publish
-            
+
+        Moltbook's API requires {"submolt", "title", "content"} -- the old
+        payload of {"content", "visibility"} was rejected by the API.
+
         Returns:
-            True if successful, False otherwise
+            "posted" -- real post published
+            "mock"   -- no API key configured (nothing was published)
+            "failed" -- a real attempt was made and the API rejected it
         """
         if not self.moltbook_api_key:
-            logger.info("📝 [MOCK] Post would be published to Moltbook:")
+            logger.info("📝 [MOCK] Post would be published to Moltbook (no MOLTBOOK_API_KEY):")
             logger.info(f"   Content: {content[:100]}...")
-            logger.info("   Status: Success (Mock - No API key configured)")
-            return True
-        
+            return "mock"
+
+        title = self._derive_title(content)
         try:
             url = f"{self.moltbook_base_url}/posts"
             headers = {
@@ -187,45 +205,53 @@ Generate ONLY the post text, nothing else."""
                 "Content-Type": "application/json"
             }
             payload = {
-                "content": content,
-                "visibility": "public"
+                "submolt": self.submolt,
+                "title": title,
+                "content": content
             }
-            
+
             response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
-            if response.status_code == 201:
-                result = response.json()
-                post_id = result.get('id', 'unknown')
+
+            if response.status_code in (200, 201):
+                try:
+                    post_id = response.json().get('id', 'unknown')
+                except ValueError:
+                    post_id = 'unknown'
                 logger.info(f"✅ Successfully posted to Moltbook (ID: {post_id})")
-                return True
+                return "posted"
             elif response.status_code == 429:
-                logger.warning("⚠️ Rate limit exceeded. Waiting before retry...")
-                return False
+                try:
+                    retry_after = response.json().get("retry_after_minutes", "unknown")
+                except ValueError:
+                    retry_after = "unknown"
+                logger.warning(f"⚠️ Rate limit exceeded (retry after {retry_after} minutes).")
+                return "failed"
             else:
                 logger.error(f"❌ Failed to post: {response.status_code} - {response.text}")
-                return False
-                
+                return "failed"
+
         except Exception as e:
             logger.error(f"❌ Error posting to Moltbook: {e}")
-            return False
-    
-    def comment_on_moltbook(self, post_id: str, comment: str) -> bool:
+            return "failed"
+
+    def comment_on_moltbook(self, post_id: str, comment: str) -> str:
         """
         Comment on a specific Moltbook post.
-        
+
         Args:
-            post_id: The ID of the post to comment on
+            post_id: The REAL (UUID) id of the post to comment on
             comment: The comment content
-            
+
         Returns:
-            True if successful, False otherwise
+            "posted" -- real comment published
+            "mock"   -- no API key configured (nothing was published)
+            "failed" -- a real attempt was made and the API rejected it
         """
         if not self.moltbook_api_key:
-            logger.info(f"💬 [MOCK] Would comment on post {post_id}:")
+            logger.info(f"💬 [MOCK] Would comment on post {post_id} (no MOLTBOOK_API_KEY):")
             logger.info(f"   Comment: {comment[:80]}...")
-            logger.info("   Status: Success (Mock - No API key configured)")
-            return True
-        
+            return "mock"
+
         try:
             url = f"{self.moltbook_base_url}/posts/{post_id}/comments"
             headers = {
@@ -235,21 +261,23 @@ Generate ONLY the post text, nothing else."""
             payload = {
                 "content": comment
             }
-            
+
             response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
-            if response.status_code == 201:
-                result = response.json()
-                comment_id = result.get('id', 'unknown')
+
+            if response.status_code in (200, 201):
+                try:
+                    comment_id = response.json().get('id', 'unknown')
+                except ValueError:
+                    comment_id = 'unknown'
                 logger.info(f"✅ Successfully commented on Moltbook (ID: {comment_id})")
-                return True
+                return "posted"
             elif response.status_code == 429:
                 logger.warning("⚠️ Rate limit exceeded for comments. Skipping...")
-                return False
+                return "failed"
             else:
                 logger.error(f"❌ Failed to comment: {response.status_code} - {response.text}")
-                return False
-                
+                return "failed"
+
         except Exception as e:
             logger.error(f"❌ Error commenting on Moltbook: {e}")
-            return False
+            return "failed"
