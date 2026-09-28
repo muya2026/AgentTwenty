@@ -175,6 +175,37 @@ AgentTwenty is built to survive:
 
 ---
 
+## 🚨 Troubleshooting: "runs are green but the agent does nothing"
+
+Earlier versions swallowed every error and always exited `0`, so GitHub Actions
+showed ✅ success while the agent only ever touched **mock data**. The pipeline
+had three real bugs (now fixed in code):
+
+1. **Dead API domain** — scraper used `api.moltbook.com` (doesn't resolve in DNS).
+   Real API: `https://www.moltbook.com/api/v1`.
+2. **Invalid post payload** — Moltbook requires `{"submolt", "title", "content"}`,
+   the old code sent `{"content", "visibility"}` (always rejected).
+3. **Comments aimed at fake ids** (`post_001`) — the API only accepts real UUIDs.
+
+**Strict mode** (`REQUIRE_REAL_ACTIONS=true`, enabled in the workflow) now makes
+the run **fail** unless:
+
+- real (non-mock) posts were fetched,
+- a real comment was published, and
+- a real daily post was published.
+
+### If the daily run goes red, check these:
+
+| Symptom in log | Cause | Fix |
+| :--- | :--- | :--- |
+| `STRICT mode requires MOLTBOOK_API_KEY` | Secret missing | Add `MOLTBOOK_API_KEY` in **Settings → Secrets and variables → Actions** |
+| `401 No API key provided` | Key invalid/revoked | Re-register the agent / rotate the key (keys start with `moltbook_`) |
+| `429` + `retry_after_minutes` | Rate limit (1 post/30 min) | Wait and re-run manually |
+| `no REAL posts were fetched` | Scraper fell back to mock | Check `https://www.moltbook.com/api/v1/posts` reachability |
+| `Failed to initialize components` | No AI keys | Set `QWEN_API_KEY` and/or `GEMINI_API_KEY` secrets |
+
+---
+
 ## 🤝 Contributing
 
 Found a bug? Want to make AgentTwenty even funnier?
