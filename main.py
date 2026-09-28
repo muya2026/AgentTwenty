@@ -49,11 +49,102 @@ def _is_real_target(post: dict) -> bool:
     return bool(post) and not post.get("mock") and bool(UUID_RE.match(str(post.get("id") or "")))
 
 
+# Secrets that must never contain whitespace/newlines (classic copy-paste issue:
+# a trailing newline in a secret makes requests raise "Invalid header value").
+_TOKEN_VARS = (
+    "MOLTBOOK_API_KEY", "QWEN_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+)
+_TEXT_VARS = (
+    "SMTP_EMAIL", "SMTP_PASSWORD", "RECIPIENT_EMAIL", "SMTP_SERVER", "MOLTBOOK_SUBMOLT",
+)
+
+
+def _sanitize_env() -> None:
+    """Auto-clean stray whitespace/newlines out of configured secrets."""
+    for name in _TOKEN_VARS:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        cleaned = re.sub(r"\s+", "", value)
+        if cleaned != value:
+            logger.warning(
+                f"⚠️ {name} contained whitespace/newlines — cleaned automatically "
+                f"(length {len(value)} → {len(cleaned)}). "
+                "Please re-save the secret without spaces."
+            )
+            os.environ[name] = cleaned
+    for name in _TEXT_VARS:
+        value = os.environ.get(name)
+        if value is not None and value.strip() != value:
+            os.environ[name] = value.strip()
+            logger.warning(f"⚠️ {name} had surrounding whitespace — trimmed.")
+
+
+def _log_key_diagnostics() -> None:
+    """Log SAFE diagnostics about key shapes (never the values themselves)."""
+    mk = os.environ.get("MOLTBOOK_API_KEY")
+    if mk:
+        logger.info(
+            f"MOLTBOOK_API_KEY: length={len(mk)}, "
+            f"starts_with_moltbook_={mk.startswith('moltbook_')}"
+        )
+        if not mk.startswith("moltbook_"):
+            logger.error("❌ MOLTBOOK_API_KEY does NOT start with 'moltbook_' — "
+                         "it looks like a placeholder or wrong value. Re-save the secret.")
+    else:
+        logger.warning("MOLTBOOK_API_KEY is not set.")
+    qk = os.environ.get("QWEN_API_KEY")
+    logger.info(f"QWEN_API_KEY: length={len(qk) if qk else 0}")
+    gk = os.environ.get("GEMINI_API_KEY")
+    logger.info(f"GEMINI_API_KEY: length={len(gk) if gk else 0} (free tier — primary engine)")
+    rk = os.environ.get("GROQ_API_KEY")
+    logger.info(f"GROQ_API_KEY: length={len(rk) if rk else 0} (free tier — backup engine)")
+
+
+def _preflight_moltbook(key: str) -> bool:
+    """
+    Verify the Moltbook API key BEFORE attempting real actions, so failures
+    are explained clearly instead of surfacing as cryptic request errors.
+    """
+    try:
+        import requests
+        response = requests.get(
+            "https://www.moltbook.com/api/v1/agents/me",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=15,
+        )
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                agent = data.get("agent") or data
+                name = agent.get("name") or agent.get("agent_name") or "?"
+            except ValueError:
+                name = "?"
+            logger.info(f"✅ Moltbook API key is valid — authenticated as '{name}'.")
+            return True
+        if response.status_code == 401:
+            logger.error("❌ Moltbook rejected MOLTBOOK_API_KEY (401 Invalid API key).")
+            logger.error(f"   Key shape: length={len(key)}, starts_with_moltbook_={key.startswith('moltbook_')}")
+            logger.error("   → Delete and re-create the secret with the real key "
+                         "(from ~/.config/moltbook/credentials.json, or re-register at "
+                         "https://moltbook.com/skill.md).")
+            return False
+        logger.warning(f"⚠️ Unexpected status {response.status_code} from key preflight — continuing anyway.")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Key preflight could not run ({e}) — continuing anyway.")
+        return True
+
+
 def main() -> int:
     """Main orchestration function for AgentTwenty daily operations."""
     logger.info("🚀 AgentTwenty Starting Daily Operation...")
     if STRICT:
         logger.info("🔒 STRICT mode (REQUIRE_REAL_ACTIONS): mock fallbacks will fail the run.")
+
+    # Clean secrets first (a stray newline in a secret breaks HTTP headers)
+    _sanitize_env()
 
     # Initialize Components (a config error here must fail loudly, not traceback)
     try:
@@ -67,10 +158,17 @@ def main() -> int:
             logger.error("   → Check that QWEN_API_KEY and/or GEMINI_API_KEY repo secrets are set.")
         return 1
 
+    # Safe key-shape diagnostics (helps spot placeholder/corrupt secrets instantly)
+    _log_key_diagnostics()
+
     # In strict mode, without a Moltbook key nothing real can happen — fail fast.
     if STRICT and not engager.moltbook_api_key:
         logger.error("❌ STRICT mode requires MOLTBOOK_API_KEY, but it is not configured.")
         logger.error("   → Add it under Settings → Secrets and variables → Actions.")
+        return 1
+
+    # In strict mode, verify the key actually works before doing anything real.
+    if STRICT and engager.moltbook_api_key and not _preflight_moltbook(engager.moltbook_api_key):
         return 1
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -94,9 +192,13 @@ def main() -> int:
     # Step 2: Analyze Data
     try:
         if posts:
-            logger.info("🧠 Analyzing posts with Qwen Coder...")
+            logger.info("🧠 Analyzing posts with AI engines (Qwen → Gemini)...")
             analysis_text = analyzer.analyze_posts(posts)
-            logger.info("✅ Analysis complete.")
+            backend = getattr(analyzer, "last_backend", None)
+            logger.info(f"✅ Analysis complete (backend: {backend}).")
+            if STRICT and backend == "fallback":
+                logger.warning("⚠️ STRICT: both AI engines failed — content is using the "
+                               "canned fallback. Check QWEN_API_KEY / GEMINI_API_KEY secrets.")
         else:
             logger.warning("⚠️ No posts to analyze. Skipping analysis step.")
             analysis_text = "No data available for analysis today."
@@ -125,7 +227,11 @@ def main() -> int:
 
         # Generate Daily Post
         daily_post = engager.generate_daily_post(analysis_text)
-        logger.info(f"Generated Daily Post: {daily_post[:50]}...")
+        generation_backend = getattr(engager, "last_backend", None)
+        logger.info(f"Generated Daily Post (via {generation_backend}): {daily_post[:50]}...")
+        if STRICT and generation_backend == "canned":
+            logger.warning("⚠️ STRICT: no AI engine available — post uses CANNED text. "
+                           "Set GEMINI_API_KEY (free tier) or QWEN_API_KEY for real content.")
         post_status = engager.post_to_moltbook(daily_post)
         if post_status == "failed":
             logger.error("❌ Real post attempt FAILED (see API error above).")
@@ -178,6 +284,10 @@ def main() -> int:
     else:
         logger.info("🏁 AgentTwenty Daily Operation Finished.")
     return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":
