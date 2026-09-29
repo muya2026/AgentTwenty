@@ -62,8 +62,11 @@ class AgentAnalyzer:
         # NOTE: we deliberately do NOT raise when keys are missing — the README
         # promises graceful degradation, and analyze_posts() falls back to
         # basic stats-based analysis when no client is available.
-        # Groq backup engine (free tier, OpenAI-compatible)
-        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        # PRIMARY engine: Groq (free tier, OpenAI-compatible).
+        # Alias-tolerant lookup: accepts GROQ_API_KEY, GROQAPI or GROQ secrets.
+        self.groq_api_key = (
+            os.getenv("GROQ_API_KEY") or os.getenv("GROQAPI") or os.getenv("GROQ")
+        )
         self.groq_client = None
         if self.groq_api_key:
             self.groq_client = OpenAI(
@@ -73,7 +76,7 @@ class AgentAnalyzer:
             )
 
         if not self.api_key and not self.gemini_api_key and not self.groq_api_key:
-            print("⚠️  No AI keys found (QWEN_API_KEY / GEMINI_API_KEY / GROQ_API_KEY). "
+            print("⚠️  No AI keys found (GROQ_API_KEY / GEMINI_API_KEY / QWEN_API_KEY). "
                   "Analysis will use the basic fallback (no LLM call).")
         
         # Initialize OpenAI client with Qwen endpoint (if Qwen key available)
@@ -169,7 +172,27 @@ Here are the Moltbook posts to analyze:
 Please provide your analysis following the guidelines in the system prompt.
 """
         
-        # Try Qwen first if available
+        # Try Groq FIRST (primary — free tier, always reachable)
+        if self.groq_client:
+            try:
+                print("🧠 Analyzing with Groq...")
+                response = self.groq_client.chat.completions.create(
+                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2048
+                )
+                analysis = response.choices[0].message.content.strip()
+                print(f"✅ Analysis complete with Groq. Generated {len(analysis)} characters.")
+                self.last_backend = "groq"
+                return analysis
+            except Exception as e:
+                print(f"⚠️ Groq analysis failed: {str(e)}")
+
+        # Try Qwen if available
         if self.client:
             try:
                 print("🧠 Analyzing with Qwen...")
@@ -212,25 +235,6 @@ Please provide your analysis following the guidelines in the system prompt.
                 error_msg = f"⚠️ Gemini analysis failed: {str(e)}"
                 print(error_msg)
 
-        # Try Groq (free-tier backup) if configured
-        if self.groq_client:
-            try:
-                print("🧠 Analyzing with Groq...")
-                response = self.groq_client.chat.completions.create(
-                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.7,
-                    max_tokens=2048
-                )
-                analysis = response.choices[0].message.content.strip()
-                print(f"✅ Analysis complete with Groq. Generated {len(analysis)} characters.")
-                self.last_backend = "groq"
-                return analysis
-            except Exception as e:
-                print(f"⚠️ Groq analysis failed: {str(e)}")
         
         # If every engine fails (or no keys are configured), use fallback analysis
         print("❌ All AI engines unavailable or failed. Using basic fallback analysis.")
@@ -363,7 +367,7 @@ By @{top_post.get('author', {}).get('username', 'unknown')}
         Compare multiple posts and identify patterns.
         
         Args:
-            posts: List of post dictionaries.
+            posts: List of posts to compare.
             
         Returns:
             Comparative analysis highlighting patterns and differences.

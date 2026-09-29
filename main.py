@@ -52,7 +52,8 @@ def _is_real_target(post: dict) -> bool:
 # Secrets that must never contain whitespace/newlines (classic copy-paste issue:
 # a trailing newline in a secret makes requests raise "Invalid header value").
 _TOKEN_VARS = (
-    "MOLTBOOK_API_KEY", "QWEN_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
+    "MOLTBOOK_API_KEY", "QWEN_API_KEY", "GEMINI_API_KEY",
+    "GROQ_API_KEY", "GROQAPI", "GROQ",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 )
 _TEXT_VARS = (
@@ -98,8 +99,13 @@ def _log_key_diagnostics() -> None:
     logger.info(f"QWEN_API_KEY: length={len(qk) if qk else 0}")
     gk = os.environ.get("GEMINI_API_KEY")
     logger.info(f"GEMINI_API_KEY: length={len(gk) if gk else 0} (free tier — primary engine)")
-    rk = os.environ.get("GROQ_API_KEY")
-    logger.info(f"GROQ_API_KEY: length={len(rk) if rk else 0} (free tier — backup engine)")
+    rk = (os.environ.get("GROQ_API_KEY") or os.environ.get("GROQAPI")
+          or os.environ.get("GROQ"))
+    logger.info(f"GROQ key: length={len(rk) if rk else 0} "
+                f"(free tier — PRIMARY engine; accepts GROQ_API_KEY/GROQAPI/GROQ)")
+    if not rk:
+        logger.warning("❌ No Groq key in env — content will fall back to Gemini/Qwen "
+                       "or canned text. Check the GROQ_API_KEY secret name/section!")
 
 
 def _preflight_moltbook(key: str) -> bool:
@@ -192,7 +198,7 @@ def main() -> int:
     # Step 2: Analyze Data
     try:
         if posts:
-            logger.info("🧠 Analyzing posts with AI engines (Qwen → Gemini)...")
+            logger.info("🧠 Analyzing posts with AI engines (Groq → Gemini → Qwen)...")
             analysis_text = analyzer.analyze_posts(posts)
             backend = getattr(analyzer, "last_backend", None)
             logger.info(f"✅ Analysis complete (backend: {backend}).")
@@ -284,10 +290,6 @@ def main() -> int:
     else:
         logger.info("🏁 AgentTwenty Daily Operation Finished.")
     return exit_code
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 if __name__ == "__main__":

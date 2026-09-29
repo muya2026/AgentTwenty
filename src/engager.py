@@ -57,20 +57,27 @@ class AgentEngager:
             except Exception as e:
                 logger.warning(f"⚠️ Could not initialize Gemini for engagement: {e}")
 
-        # Backup engine: Groq (free tier, OpenAI-compatible)
+        # PRIMARY engine: Groq (free tier, OpenAI-compatible).
+        # Alias-tolerant lookup: accepts GROQ_API_KEY, GROQAPI or GROQ secrets.
+        self.groq_api_key = (
+            os.getenv("GROQ_API_KEY") or os.getenv("GROQAPI") or os.getenv("GROQ")
+        )
         self.groq_client = None
-        if os.getenv("GROQ_API_KEY"):
+        if self.groq_api_key:
             try:
                 self.groq_client = OpenAI(
-                    api_key=os.getenv("GROQ_API_KEY"),
+                    api_key=self.groq_api_key,
                     base_url="https://api.groq.com/openai/v1",
                     timeout=30.0,
                 )
-                logger.info("✅ Groq client initialized for engagement (free tier backup)")
+                logger.info("✅ Groq client initialized for engagement (free tier, primary)")
             except Exception as e:
                 logger.warning(f"⚠️ Could not initialize Groq for engagement: {e}")
+        else:
+            logger.warning("⚠️ No Groq key found (GROQ_API_KEY / GROQAPI / GROQ) — "
+                           "engagement will try Gemini/Qwen, else canned text.")
 
-        # Which engine produced the last generation: "qwen" | "gemini" | "groq" | "canned"
+        # Which engine produced the last generation: "groq" | "gemini" | "qwen" | "canned"
         self.last_backend = None
         
         # Load persona prompt
@@ -89,9 +96,28 @@ class AgentEngager:
     def _generate(self, system_instruction: str, user_instruction: str,
                   max_tokens: int, temperature: float) -> Optional[str]:
         """
-        Try each configured LLM engine in order: Qwen (if key present) →
-        Google Gemini (free tier) → Groq (free-tier backup) → None.
+        Engine order: Groq (primary) → Gemini → Qwen → None.
+        Gemini's project is denied and Qwen's key is dead, so Groq leads;
+        the others stay as automatic fallbacks if those accounts recover.
         """
+        if self.groq_client:
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_instruction}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                text = response.choices[0].message.content.strip()
+                if text:
+                    self.last_backend = "groq"
+                    return text
+            except Exception as e:
+                logger.warning(f"⚠️ Groq generation failed ({e}) — trying next engine.")
+
         if self.client:
             try:
                 response = self.client.chat.completions.create(
@@ -123,24 +149,6 @@ class AgentEngager:
                 logger.warning("⚠️ Gemini returned empty text.")
             except Exception as e:
                 logger.warning(f"⚠️ Gemini generation failed: {e}")
-
-        if self.groq_client:
-            try:
-                response = self.groq_client.chat.completions.create(
-                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": user_instruction}
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                text = response.choices[0].message.content.strip()
-                if text:
-                    self.last_backend = "groq"
-                    return text
-            except Exception as e:
-                logger.warning(f"⚠️ Groq generation failed ({e}) — no more engines.")
 
         return None
 
