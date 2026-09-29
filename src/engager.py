@@ -28,6 +28,27 @@ def _emoji_count(text: str) -> int:
             n += 1
     return n
 
+def _strip_urls(text: str) -> str:
+    """Remove markdown links (keep label) and bare URLs — no links in replies."""
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    return " ".join(text.split()).strip()
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Hard length cap: prefer sentence boundary, else word boundary."""
+    if not limit or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in (". ", "! ", "? ", "\n"):
+        idx = cut.rfind(sep)
+        if idx >= limit // 2:
+            return cut[:idx + 1].strip()
+    idx = cut.rfind(" ")
+    if idx > 0:
+        return cut[:idx].rstrip() + "\u2026"
+    return cut.rstrip() + "\u2026"
+
 def _groq_fatal_error(err) -> bool:
     """Break the model walk ONLY on auth/network failures.
 
@@ -204,7 +225,8 @@ class AgentEngager:
 
     def _generate(self, system_instruction: str, user_instruction: str,
                   max_tokens: int, temperature: float,
-                  min_chars: int = 30, max_emojis: int = 6) -> Optional[str]:
+                  min_chars: int = 30, max_emojis: int = 6,
+                  max_chars: Optional[int] = None) -> Optional[str]:
         """
         Engine order: Groq (primary) → Gemini → Qwen → None.
         Gemini's project is denied and Qwen's key is dead, so Groq leads;
@@ -227,6 +249,7 @@ class AgentEngager:
                     text = _clean_ai_text(response.choices[0].message.content,
                                           min_chars=min_chars)
                     if text and _emoji_count(text) <= max_emojis:
+                        text = _clip_text(_strip_urls(text), max_chars)
                         self.last_backend = "groq"
                         self.last_groq_model = groq_model
                         return text
@@ -301,13 +324,14 @@ class AgentEngager:
         """
         system_instruction = f"""{self.persona_prompt}
 
-TASK: Generate a comment on the following post that:
-1. Shows genuine curiosity or asks a thought-provoking question
-2. Uses humor appropriately (light, not dismissive)
-3. Encourages the author and others to reply (algorithm hack!)
-4. Sounds like a witty tech enthusiast who's interested in everything
-5. Keep it under 280 characters
-6. Include 1-2 relevant emojis
+TASK: Write a comment on the post below. Hard requirements:
+1. Reference at least ONE specific claim, term, or phrase from the post
+   (quote it or name it precisely) — prove you actually read it
+2. Add one genuinely new angle, connection, or counter-point
+3. End with a question the author would enjoy answering
+4. STRICTLY under 280 characters — punchy beats long
+5. No URLs, links, or markdown — plain text only
+6. 1-2 emojis max; no preamble, no quotes wrapping the whole reply
 
 POST CONTENT:
 {post_content}
@@ -315,7 +339,8 @@ POST CONTENT:
 Generate ONLY the comment text, nothing else."""
 
         comment = self._generate(system_instruction, "Generate the comment now.",
-                                 max_tokens=1024, temperature=0.8)
+                                 max_tokens=1024, temperature=0.8,
+                                 max_chars=280)
         if comment:
             logger.info(f"✅ Comment generated successfully (via {self.last_backend})")
             return comment
@@ -362,11 +387,13 @@ Requirements:
 7. The first line is your own hook — an observation or question you would
    actually say out loud. Never write instructions to yourself or about
    yourself in the third person (no "Engage with...", "You are...").
+8. No URLs, links, or markdown headers anywhere in the post.
 
 Generate ONLY the post text, nothing else."""
 
         post = self._generate(system_instruction, "Generate the daily post now.",
-                              max_tokens=1024, temperature=0.9)
+                              max_tokens=1024, temperature=0.9,
+                              max_chars=500)
         if post:
             logger.info(f"✅ Daily post generated successfully (via {self.last_backend})")
             return post
