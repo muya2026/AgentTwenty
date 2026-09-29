@@ -5,6 +5,7 @@ Handles generating comments and posts, and interacting with the Moltbook API.
 
 import os
 import logging
+import unicodedata
 import requests
 from typing import Optional
 from openai import OpenAI
@@ -14,6 +15,35 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("AgentTwenty")
+
+
+def _clean_ai_text(raw, min_chars: int = 0) -> str:
+    """Sanitize LLM output before it is trusted or published.
+
+    Removes invisible/format characters (zero-width spaces, joiners, bidi
+    controls, BOM), normalizes exotic spaces, and unwraps one layer of
+    matching quotes some models add around their output.
+
+    Returns "" when nothing visible remains or the visible text is shorter
+    than ``min_chars`` — callers treat "" as failure and try the next model
+    instead of publishing ghost content.
+    """
+    if not raw:
+        return ""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    # Drop Unicode format characters (category Cf): zero-width, joiners, bidi marks
+    s = "".join(ch for ch in raw if unicodedata.category(ch) != "Cf")
+    for sp in ("\u00a0", "\u2007", "\u202f"):
+        s = s.replace(sp, " ")
+    s = s.strip()
+    # Unwrap one layer of matching quotes (handles curly pairs too)
+    _pairs = {'"': '"', "'": "'", "“": "”", "„": "”", "«": "»"}
+    if len(s) >= 2 and _pairs.get(s[0]) == s[-1]:
+        s = s[1:-1].strip()
+    if len(s) < min_chars:
+        return ""
+    return s
 
 class AgentEngager:
     """
@@ -128,7 +158,8 @@ class AgentEngager:
         return list(self._GROQ_PREFER)
 
     def _generate(self, system_instruction: str, user_instruction: str,
-                  max_tokens: int, temperature: float) -> Optional[str]:
+                  max_tokens: int, temperature: float,
+                  min_chars: int = 30) -> Optional[str]:
         """
         Engine order: Groq (primary) → Gemini → Qwen → None.
         Gemini's project is denied and Qwen's key is dead, so Groq leads;
@@ -147,11 +178,14 @@ class AgentEngager:
                         max_tokens=max_tokens,
                         temperature=temperature,
                     )
-                    text = response.choices[0].message.content.strip()
+                    text = _clean_ai_text(response.choices[0].message.content,
+                                          min_chars=min_chars)
                     if text:
                         self.last_backend = "groq"
                         self.last_groq_model = groq_model
                         return text
+                    logger.warning(f"⚠️ Groq model {groq_model} returned "
+                                   f"empty/short content — trying next model.")
                 except Exception as e:
                     if "does not exist" in str(e) or "model_not_found" in str(e):
                         skipped.append(groq_model)
@@ -172,10 +206,12 @@ class AgentEngager:
                     max_tokens=max_tokens,
                     temperature=temperature
                 )
-                text = response.choices[0].message.content.strip()
+                text = _clean_ai_text(response.choices[0].message.content,
+                                      min_chars=min_chars)
                 if text:
                     self.last_backend = "qwen"
                     return text
+                logger.warning("⚠️ Qwen returned empty/short content.")
             except Exception as e:
                 logger.warning(f"⚠️ Qwen generation failed ({e}) — trying Gemini...")
 
@@ -185,11 +221,11 @@ class AgentEngager:
                 response = self.gemini_model.generate_content(
                     f"{system_instruction}\n\n{user_instruction}"
                 )
-                text = (response.text or "").strip()
+                text = _clean_ai_text(response.text, min_chars=min_chars)
                 if text:
                     self.last_backend = "gemini"
                     return text
-                logger.warning("⚠️ Gemini returned empty text.")
+                logger.warning("⚠️ Gemini returned empty/short text.")
             except Exception as e:
                 logger.warning(f"⚠️ Gemini generation failed: {e}")
 
@@ -294,8 +330,9 @@ Generate ONLY the post text, nothing else."""
 
         Uses the first non-empty line, truncated to 80 characters.
         """
-        for line in (content or "").strip().splitlines():
-            line = " ".join(line.split()).strip()
+        content = _clean_ai_text(content)
+        for line in content.splitlines():
+            line = " ".join(_clean_ai_text(line).split()).strip()
             if line:
                 if len(line) > 80:
                     return line[:77] + "..."

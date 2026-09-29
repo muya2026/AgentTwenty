@@ -201,10 +201,14 @@ def main() -> int:
             logger.info("🧠 Analyzing posts with AI engines (Groq → Gemini → Qwen)...")
             analysis_text = analyzer.analyze_posts(posts)
             backend = getattr(analyzer, "last_backend", None)
-            logger.info(f"✅ Analysis complete (backend: {backend}).")
+            if backend == "fallback":
+                logger.warning("⚠️ Analysis: no model returned usable content — "
+                               "using canned fallback for context.")
+            else:
+                logger.info(f"✅ Analysis complete (backend: {backend}).")
             if STRICT and backend == "fallback":
-                logger.warning("⚠️ STRICT: all AI engines failed — content is using the "
-                               "canned fallback. Check GROQ_API_KEY (primary) secrets.")
+                logger.warning("⚠️ STRICT: no AI model returned usable content — "
+                               "canned analysis in use. Check GROQ_API_KEY (primary) secrets.")
         else:
             logger.warning("⚠️ No posts to analyze. Skipping analysis step.")
             analysis_text = "No data available for analysis today."

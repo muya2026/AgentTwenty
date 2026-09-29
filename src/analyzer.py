@@ -7,6 +7,7 @@ and algorithm patterns.
 """
 
 import os
+import unicodedata
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -22,6 +23,35 @@ except ImportError:
 
 # Load environment variables
 load_dotenv()
+
+
+def _clean_ai_text(raw, min_chars: int = 0) -> str:
+    """Sanitize LLM output before it is trusted or published.
+
+    Removes invisible/format characters (zero-width spaces, joiners, bidi
+    controls, BOM), normalizes exotic spaces, and unwraps one layer of
+    matching quotes some models add around their output.
+
+    Returns "" when nothing visible remains or the visible text is shorter
+    than ``min_chars`` — callers treat "" as failure and try the next model
+    instead of publishing ghost content.
+    """
+    if not raw:
+        return ""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    # Drop Unicode format characters (category Cf): zero-width, joiners, bidi marks
+    s = "".join(ch for ch in raw if unicodedata.category(ch) != "Cf")
+    for sp in ("\u00a0", "\u2007", "\u202f"):
+        s = s.replace(sp, " ")
+    s = s.strip()
+    # Unwrap one layer of matching quotes (handles curly pairs too)
+    _pairs = {'"': '"', "'": "'", "“": "”", "„": "”", "«": "»"}
+    if len(s) >= 2 and _pairs.get(s[0]) == s[-1]:
+        s = s[1:-1].strip()
+    if len(s) < min_chars:
+        return ""
+    return s
 
 
 class AgentAnalyzer:
@@ -221,11 +251,15 @@ Please provide your analysis following the guidelines in the system prompt.
                         temperature=0.7,
                         max_tokens=2048
                     )
-                    analysis = response.choices[0].message.content.strip()
-                    print(f"✅ Analysis complete with Groq (model: {groq_model}). "
-                          f"Generated {len(analysis)} characters.")
-                    self.last_backend = "groq"
-                    return analysis
+                    analysis = _clean_ai_text(response.choices[0].message.content,
+                                              min_chars=200)
+                    if analysis:
+                        print(f"✅ Analysis complete with Groq (model: {groq_model}). "
+                              f"Generated {len(analysis)} characters.")
+                        self.last_backend = "groq"
+                        return analysis
+                    print(f"⚠️ Groq model {groq_model} returned empty/short "
+                          f"content — trying next model.")
                 except Exception as e:
                     if "does not exist" in str(e) or "model_not_found" in str(e):
                         skipped.append(groq_model)
@@ -249,12 +283,14 @@ Please provide your analysis following the guidelines in the system prompt.
                     max_tokens=2048
                 )
                 
-                # Extract and return the analysis
-                analysis = response.choices[0].message.content.strip()
-                
-                print(f"✅ Analysis complete with Qwen. Generated {len(analysis)} characters.")
-                self.last_backend = "qwen"
-                return analysis
+                # Extract and validate the analysis
+                analysis = _clean_ai_text(response.choices[0].message.content,
+                                          min_chars=200)
+                if analysis:
+                    print(f"✅ Analysis complete with Qwen. Generated {len(analysis)} characters.")
+                    self.last_backend = "qwen"
+                    return analysis
+                print("⚠️ Qwen returned empty/short analysis — trying Gemini...")
                 
             except Exception as e:
                 error_msg = f"⚠️ Qwen analysis failed: {str(e)}"
@@ -268,11 +304,12 @@ Please provide your analysis following the guidelines in the system prompt.
                 full_prompt = f"{self.system_prompt}\n\n{user_message}"
                 
                 response = self.gemini_model.generate_content(full_prompt)
-                analysis = response.text.strip()
-                
-                print(f"✅ Analysis complete with Gemini. Generated {len(analysis)} characters.")
-                self.last_backend = "gemini"
-                return analysis
+                analysis = _clean_ai_text(response.text, min_chars=200)
+                if analysis:
+                    print(f"✅ Analysis complete with Gemini. Generated {len(analysis)} characters.")
+                    self.last_backend = "gemini"
+                    return analysis
+                print("⚠️ Gemini returned empty/short analysis.")
                 
             except Exception as e:
                 error_msg = f"⚠️ Gemini analysis failed: {str(e)}"
@@ -439,7 +476,7 @@ Here are the posts:
                 max_tokens=2048
             )
             
-            return response.choices[0].message.content.strip()
+            return _clean_ai_text(response.choices[0].message.content, min_chars=1)
             
         except Exception as e:
             return f"❌ Comparison failed: {str(e)}"
