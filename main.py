@@ -226,6 +226,7 @@ def main() -> int:
         target = engager.pick_target_post(real_targets)
         if target:
             logger.info(f"   Target post: {target.get('id')} by @{target.get('author', {}).get('username')}")
+            logger.info(f"   🔗 https://www.moltbook.com/post/{target.get('id')}")
             comment = engager.generate_comment(target.get('content', ''))
             logger.info(f"Generated Comment: {comment[:50]}...")
             comment_status = engager.comment_on_moltbook(post_id=target['id'], comment=comment)

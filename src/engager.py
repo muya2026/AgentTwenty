@@ -400,6 +400,41 @@ Generate ONLY the post text, nothing else."""
                 return line
         return "AgentTwenty daily insight"
 
+    @staticmethod
+    def _extract_id(data):
+        """Moltbook wraps results as {id} | {post:{id}} | {comment:{id}} | {data:{id}}."""
+        if not isinstance(data, dict):
+            return None
+        if data.get("id"):
+            return data["id"]
+        for nest in ("post", "comment", "data"):
+            inner = data.get(nest)
+            if isinstance(inner, dict) and inner.get("id"):
+                return inner["id"]
+        return None
+
+    def _verify_post(self, post_id: str) -> None:
+        """Best-effort fetch-back after publish.
+
+        Moltbook sometimes answers 2xx but silently drops the post
+        (1-per-30min rate limit, duplicate detection) — log the truth.
+        """
+        try:
+            r = requests.get(f"{self.moltbook_base_url}/posts/{post_id}", timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"⚠️ Post verification: HTTP {r.status_code} on "
+                               f"fetch-back — may not be publicly visible.")
+                return
+            data = r.json()
+            post = data.get("post", data) if isinstance(data, dict) else {}
+            if isinstance(post, dict) and (post.get("isDeleted") or post.get("is_deleted")):
+                logger.warning("⚠️ Post verification: server reports the post as "
+                               "deleted — silently dropped (rate limit / duplicate).")
+            else:
+                logger.info("   🔍 Verified live on Moltbook (fetch-back OK).")
+        except Exception as e:
+            logger.warning(f"⚠️ Post verification skipped: {e}")
+
     def post_to_moltbook(self, content: str) -> str:
         """
         Post content to Moltbook.
@@ -434,10 +469,16 @@ Generate ONLY the post text, nothing else."""
 
             if response.status_code in (200, 201):
                 try:
-                    post_id = response.json().get('id', 'unknown')
+                    data = response.json()
                 except ValueError:
-                    post_id = 'unknown'
-                logger.info(f"✅ Successfully posted to Moltbook (ID: {post_id})")
+                    data = {}
+                post_id = self._extract_id(data) or "unknown"
+                if post_id != "unknown":
+                    site_url = f"https://www.moltbook.com/post/{post_id}"
+                    logger.info(f"✅ Successfully posted to Moltbook: {site_url}")
+                    self._verify_post(post_id)
+                else:
+                    logger.info("✅ Successfully posted to Moltbook (ID: unknown)")
                 return "posted"
             elif response.status_code == 429:
                 try:
@@ -525,10 +566,12 @@ Generate ONLY the post text, nothing else."""
 
             if response.status_code in (200, 201):
                 try:
-                    comment_id = response.json().get('id', 'unknown')
+                    data = response.json()
                 except ValueError:
-                    comment_id = 'unknown'
+                    data = {}
+                comment_id = self._extract_id(data) or "unknown"
                 logger.info(f"✅ Successfully commented on Moltbook (ID: {comment_id})")
+                logger.info(f"   🔗 https://www.moltbook.com/post/{post_id}")
                 return "posted"
             elif response.status_code == 429:
                 logger.warning("⚠️ Rate limit exceeded for comments. Skipping...")
