@@ -93,6 +93,40 @@ class AgentEngager:
             logger.error(f"Failed to load persona prompt: {e}")
             return "You are AgentTwenty, a funny, curious AI problem-solver."
     
+    # Best-first Groq candidates when live discovery is unavailable
+    _GROQ_PREFER = [
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+        "llama-3.1-8b-instant",
+        "llama-4-scout-17b-16e-instruct",
+        "qwen3-32b",
+    ]
+
+    def _groq_models(self) -> list:
+        """
+        Ordered list of Groq model ids to try for this run.
+        GROQ_MODEL env wins; otherwise discover what this key can use,
+        putting known-good candidates first; else walk the hardcoded list.
+        """
+        env_model = os.getenv("GROQ_MODEL")
+        if env_model:
+            return [env_model]
+        if getattr(self, "_groq_models_cache", None):
+            return self._groq_models_cache
+        try:
+            available = {m.id for m in self.groq_client.models.list()}
+            if available:
+                preferred = [m for m in self._GROQ_PREFER if m in available]
+                blocked = ("whisper", "tts", "stt", "playai", "music",
+                           "guard", "image", "csm", "ocr")
+                others = sorted(m for m in available
+                                if not any(b in m for b in blocked))
+                self._groq_models_cache = preferred + others or sorted(available)
+                return self._groq_models_cache
+        except Exception as e:
+            logger.warning(f"⚠️ Could not list Groq models ({e}); walking candidates.")
+        return list(self._GROQ_PREFER)
+
     def _generate(self, system_instruction: str, user_instruction: str,
                   max_tokens: int, temperature: float) -> Optional[str]:
         """
@@ -101,22 +135,31 @@ class AgentEngager:
         the others stay as automatic fallbacks if those accounts recover.
         """
         if self.groq_client:
-            try:
-                response = self.groq_client.chat.completions.create(
-                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": user_instruction}
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                text = response.choices[0].message.content.strip()
-                if text:
-                    self.last_backend = "groq"
-                    return text
-            except Exception as e:
-                logger.warning(f"⚠️ Groq generation failed ({e}) — trying next engine.")
+            skipped = []
+            for groq_model in self._groq_models():
+                try:
+                    response = self.groq_client.chat.completions.create(
+                        model=groq_model,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": user_instruction}
+                        ],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                    text = response.choices[0].message.content.strip()
+                    if text:
+                        self.last_backend = "groq"
+                        self.last_groq_model = groq_model
+                        return text
+                except Exception as e:
+                    if "does not exist" in str(e) or "model_not_found" in str(e):
+                        skipped.append(groq_model)
+                        continue  # model retired/inaccessible — try the next one
+                    logger.warning(f"⚠️ Groq generation failed ({e}) — trying next engine.")
+                    break  # auth/network issue: other models won't help
+            if skipped:
+                logger.warning(f"⚠️ Groq models not available on this key: {', '.join(skipped)}")
 
         if self.client:
             try:

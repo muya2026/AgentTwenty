@@ -147,6 +147,40 @@ analysis clearly with sections, but keep the tone conversational and engaging.
                 "Please ensure prompts/persona.md exists."
             )
     
+    # Best-first Groq candidates when live discovery is unavailable
+    _GROQ_PREFER = [
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+        "llama-3.1-8b-instant",
+        "llama-4-scout-17b-16e-instruct",
+        "qwen3-32b",
+    ]
+
+    def _groq_models(self) -> list:
+        """
+        Ordered list of Groq model ids to try for this run.
+        GROQ_MODEL env wins; otherwise discover what this key can use,
+        putting known-good candidates first; else walk the hardcoded list.
+        """
+        env_model = os.getenv("GROQ_MODEL")
+        if env_model:
+            return [env_model]
+        if getattr(self, "_groq_models_cache", None):
+            return self._groq_models_cache
+        try:
+            available = {m.id for m in self.groq_client.models.list()}
+            if available:
+                preferred = [m for m in self._GROQ_PREFER if m in available]
+                blocked = ("whisper", "tts", "stt", "playai", "music",
+                           "guard", "image", "csm", "ocr")
+                others = sorted(m for m in available
+                                if not any(b in m for b in blocked))
+                self._groq_models_cache = preferred + others or sorted(available)
+                return self._groq_models_cache
+        except Exception as e:
+            print(f"⚠️ Could not list Groq models ({e}); walking candidates.")
+        return list(self._GROQ_PREFER)
+
     def analyze_posts(self, posts: List[Dict[str, Any]]) -> str:
         """
         Send posts to Qwen API for analysis, with Gemini as fallback.
@@ -174,23 +208,32 @@ Please provide your analysis following the guidelines in the system prompt.
         
         # Try Groq FIRST (primary — free tier, always reachable)
         if self.groq_client:
-            try:
-                print("🧠 Analyzing with Groq...")
-                response = self.groq_client.chat.completions.create(
-                    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.7,
-                    max_tokens=2048
-                )
-                analysis = response.choices[0].message.content.strip()
-                print(f"✅ Analysis complete with Groq. Generated {len(analysis)} characters.")
-                self.last_backend = "groq"
-                return analysis
-            except Exception as e:
-                print(f"⚠️ Groq analysis failed: {str(e)}")
+            print("🧠 Analyzing with Groq...")
+            skipped = []
+            for groq_model in self._groq_models():
+                try:
+                    response = self.groq_client.chat.completions.create(
+                        model=groq_model,
+                        messages=[
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": user_message}
+                        ],
+                        temperature=0.7,
+                        max_tokens=2048
+                    )
+                    analysis = response.choices[0].message.content.strip()
+                    print(f"✅ Analysis complete with Groq (model: {groq_model}). "
+                          f"Generated {len(analysis)} characters.")
+                    self.last_backend = "groq"
+                    return analysis
+                except Exception as e:
+                    if "does not exist" in str(e) or "model_not_found" in str(e):
+                        skipped.append(groq_model)
+                        continue  # model retired/inaccessible — try the next one
+                    print(f"⚠️ Groq analysis failed: {str(e)}")
+                    break  # auth/network issue: other models won't help
+            if skipped:
+                print(f"⚠️ Groq models not available on this key: {', '.join(skipped)}")
 
         # Try Qwen if available
         if self.client:

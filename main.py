@@ -98,7 +98,7 @@ def _log_key_diagnostics() -> None:
     qk = os.environ.get("QWEN_API_KEY")
     logger.info(f"QWEN_API_KEY: length={len(qk) if qk else 0}")
     gk = os.environ.get("GEMINI_API_KEY")
-    logger.info(f"GEMINI_API_KEY: length={len(gk) if gk else 0} (free tier — primary engine)")
+    logger.info(f"GEMINI_API_KEY: length={len(gk) if gk else 0} (fallback engine; project currently denied by Google)")
     rk = (os.environ.get("GROQ_API_KEY") or os.environ.get("GROQAPI")
           or os.environ.get("GROQ"))
     logger.info(f"GROQ key: length={len(rk) if rk else 0} "
@@ -203,8 +203,8 @@ def main() -> int:
             backend = getattr(analyzer, "last_backend", None)
             logger.info(f"✅ Analysis complete (backend: {backend}).")
             if STRICT and backend == "fallback":
-                logger.warning("⚠️ STRICT: both AI engines failed — content is using the "
-                               "canned fallback. Check QWEN_API_KEY / GEMINI_API_KEY secrets.")
+                logger.warning("⚠️ STRICT: all AI engines failed — content is using the "
+                               "canned fallback. Check GROQ_API_KEY (primary) secrets.")
         else:
             logger.warning("⚠️ No posts to analyze. Skipping analysis step.")
             analysis_text = "No data available for analysis today."
@@ -237,7 +237,7 @@ def main() -> int:
         logger.info(f"Generated Daily Post (via {generation_backend}): {daily_post[:50]}...")
         if STRICT and generation_backend == "canned":
             logger.warning("⚠️ STRICT: no AI engine available — post uses CANNED text. "
-                           "Set GEMINI_API_KEY (free tier) or QWEN_API_KEY for real content.")
+                           "Check the GROQ_API_KEY secret (primary free-tier engine).")
         post_status = engager.post_to_moltbook(daily_post)
         if post_status == "failed":
             logger.error("❌ Real post attempt FAILED (see API error above).")
