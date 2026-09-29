@@ -5,6 +5,7 @@ Handles generating comments and posts, and interacting with the Moltbook API.
 
 import os
 import logging
+import re
 import unicodedata
 import requests
 from typing import Optional
@@ -358,6 +359,9 @@ Requirements:
 4. Include exactly 3-5 strategic hashtags (mix of popular and niche)
 5. Keep it under 280 characters
 6. Sound enthusiastic and curious
+7. The first line is your own hook — an observation or question you would
+   actually say out loud. Never write instructions to yourself or about
+   yourself in the third person (no "Engage with...", "You are...").
 
 Generate ONLY the post text, nothing else."""
 
@@ -394,6 +398,10 @@ Generate ONLY the post text, nothing else."""
         content = _clean_ai_text(content)
         for line in content.splitlines():
             line = " ".join(_clean_ai_text(line).split()).strip()
+            # Titles render as plain text — strip emphasis so ** never shows
+            line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+            line = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"\1", line)
+            line = line.strip()
             if line:
                 if len(line) > 80:
                     return line[:77] + "..."
