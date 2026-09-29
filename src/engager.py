@@ -17,6 +17,39 @@ load_dotenv()
 logger = logging.getLogger("AgentTwenty")
 
 
+def _groq_fatal_error(err) -> bool:
+    """Break the model walk ONLY on auth/network failures.
+
+    Everything else — model retired, terms not accepted, context too small,
+    bad request — is model-specific and the caller should try the next model.
+    """
+    s = str(err).lower()
+    fatal = ("401", "403", "unauthorized", "invalid api key", "incorrect api key",
+             "authentication", "connection error", "failed to resolve",
+             "name or service not known", "timed out", "ssl")
+    return any(m in s for m in fatal)
+
+
+def _groq_create(client, *, model, messages, max_tokens, temperature):
+    """Chat completion with two guardrails for reasoning models:
+
+    - reasoning_effort='low' so the visible answer isn't starved by
+      reasoning tokens (small max_tokens => empty content otherwise);
+    - one retry without the parameter if a model rejects it.
+    """
+    kwargs = dict(model=model, messages=messages,
+                  max_tokens=max_tokens, temperature=temperature)
+    if "gpt-oss" in model:
+        kwargs["reasoning_effort"] = "low"
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if "reasoning_effort" in str(e):
+            kwargs.pop("reasoning_effort", None)
+            return client.chat.completions.create(**kwargs)
+        raise
+
+
 def _clean_ai_text(raw, min_chars: int = 0) -> str:
     """Sanitize LLM output before it is trusted or published.
 
@@ -148,7 +181,8 @@ class AgentEngager:
             if available:
                 preferred = [m for m in self._GROQ_PREFER if m in available]
                 blocked = ("whisper", "tts", "stt", "playai", "music",
-                           "guard", "image", "csm", "ocr")
+                           "guard", "image", "csm", "ocr", "orpheus",
+                           "canopylabs", "arabic", "kokoro", "deepgram")
                 others = sorted(m for m in available
                                 if not any(b in m for b in blocked))
                 self._groq_models_cache = preferred + others or sorted(available)
@@ -169,7 +203,8 @@ class AgentEngager:
             skipped = []
             for groq_model in self._groq_models():
                 try:
-                    response = self.groq_client.chat.completions.create(
+                    response = _groq_create(
+                        self.groq_client,
                         model=groq_model,
                         messages=[
                             {"role": "system", "content": system_instruction},
@@ -187,11 +222,16 @@ class AgentEngager:
                     logger.warning(f"⚠️ Groq model {groq_model} returned "
                                    f"empty/short content — trying next model.")
                 except Exception as e:
-                    if "does not exist" in str(e) or "model_not_found" in str(e):
+                    msg = str(e)
+                    if ("does not exist" in msg or "model_not_found" in msg
+                            or "model_terms_required" in msg):
                         skipped.append(groq_model)
-                        continue  # model retired/inaccessible — try the next one
-                    logger.warning(f"⚠️ Groq generation failed ({e}) — trying next engine.")
-                    break  # auth/network issue: other models won't help
+                        continue  # model retired/needs-terms — try the next one
+                    if _groq_fatal_error(msg):
+                        logger.warning(f"⚠️ Groq generation failed ({e}) — trying next engine.")
+                        break  # auth/network issue: other engines won't help
+                    logger.warning(f"⚠️ Groq model {groq_model} rejected the request "
+                                   f"— trying next: {msg[:140]}")
             if skipped:
                 logger.warning(f"⚠️ Groq models not available on this key: {', '.join(skipped)}")
 
@@ -259,7 +299,7 @@ POST CONTENT:
 Generate ONLY the comment text, nothing else."""
 
         comment = self._generate(system_instruction, "Generate the comment now.",
-                                 max_tokens=150, temperature=0.8)
+                                 max_tokens=600, temperature=0.8)
         if comment:
             logger.info(f"✅ Comment generated successfully (via {self.last_backend})")
             return comment
@@ -307,7 +347,7 @@ Requirements:
 Generate ONLY the post text, nothing else."""
 
         post = self._generate(system_instruction, "Generate the daily post now.",
-                              max_tokens=200, temperature=0.9)
+                              max_tokens=600, temperature=0.9)
         if post:
             logger.info(f"✅ Daily post generated successfully (via {self.last_backend})")
             return post
@@ -321,7 +361,13 @@ Generate ONLY the post text, nothing else."""
             "💡 Pattern alert: Seeing more agents that specialize in niche verticals vs general purpose. Specialization wins again? #AIAgents #Strategy"
         ]
         logger.warning("⚠️ Using canned daily post (no AI engine available).")
-        return random.choice(fallback_posts)
+        canned = random.choice(fallback_posts)
+        # Stamp the date into the first line so repeated canned posts never
+        # share a title (Moltbook penalizes duplicate titles).
+        from datetime import datetime
+        head, _, tail = canned.partition(" ")
+        stamp = datetime.now().strftime("%b %d")
+        return f"{head} {stamp} {tail}".rstrip()
 
     @staticmethod
     def _derive_title(content: str) -> str:

@@ -54,6 +54,40 @@ def _clean_ai_text(raw, min_chars: int = 0) -> str:
     return s
 
 
+
+def _groq_fatal_error(err) -> bool:
+    """Break the model walk ONLY on auth/network failures.
+
+    Everything else — model retired, terms not accepted, context too small,
+    bad request — is model-specific and the caller should try the next model.
+    """
+    s = str(err).lower()
+    fatal = ("401", "403", "unauthorized", "invalid api key", "incorrect api key",
+             "authentication", "connection error", "failed to resolve",
+             "name or service not known", "timed out", "ssl")
+    return any(m in s for m in fatal)
+
+
+def _groq_create(client, *, model, messages, max_tokens, temperature):
+    """Chat completion with two guardrails for reasoning models:
+
+    - reasoning_effort='low' so the visible answer isn't starved by
+      reasoning tokens (small max_tokens => empty content otherwise);
+    - one retry without the parameter if a model rejects it.
+    """
+    kwargs = dict(model=model, messages=messages,
+                  max_tokens=max_tokens, temperature=temperature)
+    if "gpt-oss" in model:
+        kwargs["reasoning_effort"] = "low"
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if "reasoning_effort" in str(e):
+            kwargs.pop("reasoning_effort", None)
+            return client.chat.completions.create(**kwargs)
+        raise
+
+
 class AgentAnalyzer:
     """
     Analyzer class that leverages Qwen (via OpenAI-compatible API) to 
@@ -202,7 +236,8 @@ analysis clearly with sections, but keep the tone conversational and engaging.
             if available:
                 preferred = [m for m in self._GROQ_PREFER if m in available]
                 blocked = ("whisper", "tts", "stt", "playai", "music",
-                           "guard", "image", "csm", "ocr")
+                           "guard", "image", "csm", "ocr", "orpheus",
+                           "canopylabs", "arabic", "kokoro", "deepgram")
                 others = sorted(m for m in available
                                 if not any(b in m for b in blocked))
                 self._groq_models_cache = preferred + others or sorted(available)
@@ -242,7 +277,8 @@ Please provide your analysis following the guidelines in the system prompt.
             skipped = []
             for groq_model in self._groq_models():
                 try:
-                    response = self.groq_client.chat.completions.create(
+                    response = _groq_create(
+                        self.groq_client,
                         model=groq_model,
                         messages=[
                             {"role": "system", "content": self.system_prompt},
@@ -261,11 +297,16 @@ Please provide your analysis following the guidelines in the system prompt.
                     print(f"⚠️ Groq model {groq_model} returned empty/short "
                           f"content — trying next model.")
                 except Exception as e:
-                    if "does not exist" in str(e) or "model_not_found" in str(e):
+                    msg = str(e)
+                    if ("does not exist" in msg or "model_not_found" in msg
+                            or "model_terms_required" in msg):
                         skipped.append(groq_model)
-                        continue  # model retired/inaccessible — try the next one
-                    print(f"⚠️ Groq analysis failed: {str(e)}")
-                    break  # auth/network issue: other models won't help
+                        continue  # model retired/needs-terms — try the next one
+                    if _groq_fatal_error(msg):
+                        print(f"⚠️ Groq analysis failed: {msg}")
+                        break  # auth/network issue: other engines won't help
+                    print(f"⚠️ Groq model {groq_model} rejected the request "
+                          f"— trying next: {msg[:140]}")
             if skipped:
                 print(f"⚠️ Groq models not available on this key: {', '.join(skipped)}")
 
@@ -321,6 +362,14 @@ Please provide your analysis following the guidelines in the system prompt.
         self.last_backend = "fallback"
         return self._fallback_analysis(posts, "All AI engines unavailable or failed")
     
+    @staticmethod
+    def _truncate(text: str, limit: int = 700) -> str:
+        """Cap per-post content so the whole prompt fits small-context models."""
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + " ..."
+
     def _format_posts_for_analysis(self, posts: List[Dict[str, Any]]) -> str:
         """
         Format a list of posts into a readable string for LLM analysis.
@@ -346,7 +395,7 @@ Verified: {author.get('verified', False)}
 Followers: {author.get('followers', 0):,}
 
 Content:
-{post.get('content', 'No content')}
+{self._truncate(post.get('content', 'No content'), 700)}
 
 Engagement:
 - Likes: {post.get('likes', 0):,}
