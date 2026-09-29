@@ -220,10 +220,11 @@ def main() -> int:
     try:
         logger.info("💬 Generating engagement content...")
 
-        # Comment on the first REAL post (never on mock ids like "post_001")
+        # Comment on a REAL post we have not already commented on
+        # (never on mock ids like "post_001"; rotates off repeated targets)
         real_targets = [p for p in posts if _is_real_target(p)]
-        if real_targets:
-            target = real_targets[0]
+        target = engager.pick_target_post(real_targets)
+        if target:
             logger.info(f"   Target post: {target.get('id')} by @{target.get('author', {}).get('username')}")
             comment = engager.generate_comment(target.get('content', ''))
             logger.info(f"Generated Comment: {comment[:50]}...")

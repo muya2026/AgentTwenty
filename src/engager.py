@@ -17,6 +17,16 @@ load_dotenv()
 logger = logging.getLogger("AgentTwenty")
 
 
+def _emoji_count(text: str) -> int:
+    """Approximate emoji count (modern emoji blocks + misc symbols)."""
+    n = 0
+    for ch in text or "":
+        o = ord(ch)
+        if (0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF
+                or 0x2B00 <= o <= 0x2BFF or o in (0x00A9, 0x00AE, 0x2764)):
+            n += 1
+    return n
+
 def _groq_fatal_error(err) -> bool:
     """Break the model walk ONLY on auth/network failures.
 
@@ -193,7 +203,7 @@ class AgentEngager:
 
     def _generate(self, system_instruction: str, user_instruction: str,
                   max_tokens: int, temperature: float,
-                  min_chars: int = 30) -> Optional[str]:
+                  min_chars: int = 30, max_emojis: int = 6) -> Optional[str]:
         """
         Engine order: Groq (primary) → Gemini → Qwen → None.
         Gemini's project is denied and Qwen's key is dead, so Groq leads;
@@ -215,12 +225,17 @@ class AgentEngager:
                     )
                     text = _clean_ai_text(response.choices[0].message.content,
                                           min_chars=min_chars)
-                    if text:
+                    if text and _emoji_count(text) <= max_emojis:
                         self.last_backend = "groq"
                         self.last_groq_model = groq_model
                         return text
-                    logger.warning(f"⚠️ Groq model {groq_model} returned "
-                                   f"empty/short content — trying next model.")
+                    if text:
+                        logger.warning(f"⚠️ Groq model {groq_model} returned an "
+                                       f"emoji wall ({_emoji_count(text)} emojis) — "
+                                       f"trying next model.")
+                    else:
+                        logger.warning(f"⚠️ Groq model {groq_model} returned "
+                                       f"empty/short content — trying next model.")
                 except Exception as e:
                     msg = str(e)
                     if ("does not exist" in msg or "model_not_found" in msg
@@ -248,10 +263,10 @@ class AgentEngager:
                 )
                 text = _clean_ai_text(response.choices[0].message.content,
                                       min_chars=min_chars)
-                if text:
+                if text and _emoji_count(text) <= max_emojis:
                     self.last_backend = "qwen"
                     return text
-                logger.warning("⚠️ Qwen returned empty/short content.")
+                logger.warning("⚠️ Qwen returned empty/short or emoji-wall content.")
             except Exception as e:
                 logger.warning(f"⚠️ Qwen generation failed ({e}) — trying Gemini...")
 
@@ -262,10 +277,10 @@ class AgentEngager:
                     f"{system_instruction}\n\n{user_instruction}"
                 )
                 text = _clean_ai_text(response.text, min_chars=min_chars)
-                if text:
+                if text and _emoji_count(text) <= max_emojis:
                     self.last_backend = "gemini"
                     return text
-                logger.warning("⚠️ Gemini returned empty/short text.")
+                logger.warning("⚠️ Gemini returned empty/short or emoji-wall text.")
             except Exception as e:
                 logger.warning(f"⚠️ Gemini generation failed: {e}")
 
@@ -299,7 +314,7 @@ POST CONTENT:
 Generate ONLY the comment text, nothing else."""
 
         comment = self._generate(system_instruction, "Generate the comment now.",
-                                 max_tokens=600, temperature=0.8)
+                                 max_tokens=1024, temperature=0.8)
         if comment:
             logger.info(f"✅ Comment generated successfully (via {self.last_backend})")
             return comment
@@ -347,7 +362,7 @@ Requirements:
 Generate ONLY the post text, nothing else."""
 
         post = self._generate(system_instruction, "Generate the daily post now.",
-                              max_tokens=600, temperature=0.9)
+                              max_tokens=1024, temperature=0.9)
         if post:
             logger.info(f"✅ Daily post generated successfully (via {self.last_backend})")
             return post
@@ -438,6 +453,45 @@ Generate ONLY the post text, nothing else."""
         except Exception as e:
             logger.error(f"❌ Error posting to Moltbook: {e}")
             return "failed"
+
+    def _already_commented(self, post_id: str) -> bool:
+        """True if agenttwenty already commented on this post (live check).
+
+        Uses GET /posts/{id}/comments?sort=new and scans for our author name.
+        Fail-open: any API hiccup means 'not commented' (same as old behavior).
+        """
+        if not post_id:
+            return False
+        try:
+            r = requests.get(
+                f"{self.moltbook_base_url}/posts/{post_id}/comments",
+                params={"sort": "new", "limit": 100},
+                timeout=12,
+            )
+            if r.status_code != 200:
+                return False
+            data = r.json()
+            items = data.get("comments") if isinstance(data, dict) else data
+            for c in items or []:
+                a = c.get("author") or {}
+                name = str(a.get("name") or a.get("username") or "").lower()
+                if name == "agenttwenty":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def pick_target_post(self, targets: list) -> Optional[dict]:
+        """Choose a REAL post to comment on, skipping posts we already
+        commented on (keeps daily runs from hammering the same hot post)."""
+        if not targets:
+            return None
+        for t in targets:
+            if t.get("id") and not self._already_commented(t["id"]):
+                return t
+        logger.info("   All top targets already have our comment — rotating to a random one.")
+        import random
+        return random.choice(targets)
 
     def comment_on_moltbook(self, post_id: str, comment: str) -> str:
         """
